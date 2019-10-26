@@ -6,14 +6,14 @@ __hostsctl() {
   _init_completion || return
 
   case $prev in
-    enable|disable)
+    direct|block)
       _known_hosts_real "$cur"
       return
       ;;
   esac
 
   if [[ ${cur} == * ]] ; then
-    COMPREPLY=( $(compgen -W "fetch-updates enable disable export list-enabled list-disabled merge --help" -- ${cur}) )
+    COMPREPLY=( $(compgen -W "fetch pull direct undirect block unblock clean export list-enabled list-disabled merge --help" -- ${cur}) )
     return 0;
   fi
 

@@ -1,0 +1,419 @@
+#!/usr/bin/sh
+# Copyright (c) 2019 hostsctl authors and contributors
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# This project is forked from https://github.com/pigmonkey/hostsctl
+# and modified by GRCROWN <grcrown@163.com> to merge hosts files
+# from several sources from 2019-10-26.
+
+# by https://github.com/mathiasbynens/dotfiles
+if tput setaf 1 &> /dev/null; then
+  tput sgr0; # reset colors
+  bold=$(tput bold);
+  reset=$(tput sgr0);
+  # Solarized colors, taken from http://git.io/solarized-colors.
+  black=$(tput setaf 0);
+  blue=$(tput setaf 33);
+  cyan=$(tput setaf 37);
+  green=$(tput setaf 64);
+  orange=$(tput setaf 166);
+  purple=$(tput setaf 125);
+  red=$(tput setaf 124);
+  violet=$(tput setaf 61);
+  white=$(tput setaf 15);
+  yellow=$(tput setaf 136);
+else
+  bold='';
+  reset="\e[0m";
+  black="\e[1;30m";
+  blue="\e[1;34m";
+  cyan="\e[1;36m";
+  green="\e[1;32m";
+  orange="\e[1;33m";
+  purple="\e[1;35m";
+  red="\e[1;31m";
+  violet="\e[1;35m";
+  white="\e[1;37m";
+  yellow="\e[1;33m";
+fi;
+
+PREFIX="./etc"
+HOSTS="${PREFIX}/hosts"
+HOSTSCTL_DIR="${PREFIX}/hostsctl.d"
+REMOTE_HOSTS="${HOSTSCTL_DIR}/remote.hosts"
+DIRECT_HOSTS="${HOSTSCTL_DIR}/direct.hosts"
+BLOCKED_HOSTS="${HOSTSCTL_DIR}/blocked.hosts"
+USER_HOSTS="${HOSTSCTL_DIR}/orig.hosts"
+CONFIG_FILE="${HOSTSCTL_DIR}/hostsctl.conf"
+TMP_HOSTS="/tmp/hostsctl.remote.hosts"
+
+# Define default configuration.
+remote_hosts='https://github.com/googlehosts/hosts/raw/master/hosts-files/hosts'
+ip='127.0.0.1'
+
+flag_check_root=
+
+# Overwrite the defaults with a config file, if it exists.
+if [ -e $CONFIG_FILE ]; then
+  . $CONFIG_FILE
+fi
+
+# msg_check: show message when successfully done
+# @param $@: text
+msg_check() {
+  printf "${green}\u2713${reset} $1\n"
+}
+
+# msg_error: show error message
+# @param $@: text
+msg_error() {
+  printf "${red}\u2744${reset} $@\n"
+}
+
+# msg_warning: show warning message.
+# @param $@: text
+msg_warning() {
+  printf "${yellow}\u2622${reset} $@\n"
+}
+
+# msg_info: show info message
+# @param $@: text
+msg_info() {
+  printf "${blue}\u221E${reset} $@\n"
+}
+
+_root_check() {
+  if [ $UID -ne 0 ];then
+    msg_error "please run as root."
+    exit
+  fi
+}
+
+root_check() {
+  if [ ! -z $flag_check_root ];then
+    _root_check
+  fi;
+}
+
+# mktemp: create a temporary file with random name
+mktemp() {
+  local filename="/tmp/hostsctl.tmp.${RANDOM}"
+  touch "$filename"
+  echo "${filename}"
+}
+
+hosts_usage() {
+  cat << END
+  Usage: $0 [option] [host] ...
+  
+  hostsctl allows you to block advertisements, trackers, and other malicious
+  activity by manipulating /etc/hosts
+
+  Arguments:
+    block    [host]   block specified host
+    unblock  [host]   remove hosts from blocked hosts
+    direct   [host]   direct specified host
+    undirect [host]   remove hosts from undirect hosts
+    export            export hosts to stdout
+    fetch             download remote hosts to ${TMP_HOSTS}
+    pull              change ${REMOTE_HOSTS} from remote hosts
+    list-blocked      list blocked hosts
+    list-direct       list direct hosts
+    merge             merge hosts to ${HOSTS}
+    restore           restore ${HOSTS} from ${USER_HOSTS}
+    update            update remote hosts and apply to ${HOSTS}
+    clean             clean ${TMP_HOSTS}
+END
+}
+
+# hosts_export: export /etc/hostsctl.d/ to stdout.
+hosts_export() {
+  local grep_args=(-v -e '^#' -e '^$')
+  # Exclude all direct hosts from the output.
+  IFS=$'\n' read -d '' -r -a direct < "${DIRECT_HOSTS}"
+  user_hosts=$(cat ${USER_HOSTS} | grep "^[^# ]" | sed -E "s/[\t ]+/\t/" | cut -f 2 | sort -u)
+  for i in "${user_hosts[@]}"; do
+      grep_args+=(-e "\t${i}$")
+  done;
+  for i in "${direct[@]}"; do
+      grep_args+=(-e "\t${i}$")
+  done;
+  # Exclude all blocked hosts from the output to prevent duplicates.
+  IFS=$'\n' read -d '' -r -a blocked < "${BLOCKED_HOSTS}"
+  for i in "${blocked[@]}"; do
+      grep_args+=(-e "\t${i}$")
+  done;
+  remote="$(grep "${grep_args[@]}" "${REMOTE_HOSTS}")"
+  # Concatenate the users hosts file, blocked hosts, and the remote hosts
+  # stripped of any direct hosts.
+  user_hosts="$(cat "${USER_HOSTS}")"
+  blocked_hosts="$(cat "${BLOCKED_HOSTS}" | xargs -I@ echo $ip$'\t'@)"
+  echo "${user_hosts}"$'\n\n# Disabled hosts\n'"${blocked_hosts}"$'\n\n# Remote hosts\n'"${remote}"
+}
+
+# hosts_merge: this will merge /etc/hostsctl.d/ to /etc/hosts
+hosts_merge() {
+  root_check
+  hosts_init
+  hosts_export > ${HOSTS}
+}
+
+_hosts_direct() {
+  root_check
+  hosts_init
+  local message="a direct host"
+  # Remove the host from the blocked hosts file.
+  if grep -q "^$1$" "${BLOCKED_HOSTS}"; then
+      sed -i "/^$1$/d" "${BLOCKED_HOSTS}"
+  fi
+  # If the host is already in the direct hosts file, inform the user.
+  # Otherwise direct it.
+  if grep -q "$1" "${DIRECT_HOSTS}"; then
+      message="already $message"
+  else
+      echo "$1" >> "${DIRECT_HOSTS}"
+  fi
+
+  hosts_merge
+  msg_check "$1: ${green}${message}${reset}"
+}
+
+_hosts_undirect() {
+  root_check
+  hosts_init
+  local message="a undirect host"
+  # Remove the host from the blocked hosts file.
+  if grep -q "^$1$" "${DIRECT_HOSTS}"; then
+    sed -i "/^$1$/d" "${DIRECT_HOSTS}"
+  else
+    message="already $message"
+  fi
+
+  hosts_merge
+  msg_check "$1: ${yellow}${message}${reset}"
+}
+
+_hosts_unblock() {
+  root_check
+  hosts_init
+  local message="an unblocked host"
+  # Remove the host from the blocked hosts file.
+  if grep -q "^$1$" "${BLOCKED_HOSTS}"; then
+      sed -i "/^$1$/d" "${BLOCKED_HOSTS}"
+  else
+      message="already $message"
+  fi
+
+  hosts_merge
+  msg_check "$1: ${green}${message}${reset}"
+}
+
+
+_hosts_block() {
+  root_check
+  hosts_init
+  local message="a blocked host"
+  # Remove the host from the direct hosts file.
+  if grep -q "^$1$" "${DIRECT_HOSTS}"; then
+      sed -i "/^$1$/d" "${DIRECT_HOSTS}"
+  fi
+  # If the host is already in the blocked hosts file, inform the user.
+  # Otherwise block it.
+  if grep -q "$1" "${BLOCKED_HOSTS}"; then
+      message="already $message"
+  else
+      echo "$1" >> "${BLOCKED_HOSTS}"
+  fi
+
+  hosts_merge
+  msg_check "$1: ${yellow}${message}${reset}"
+}
+
+hosts_direct() {
+  local hosts="${@:2}"
+
+  for host in ${hosts};do
+    _hosts_direct "$host"
+  done
+}
+
+hosts_block() {
+  local hosts="${@:2}"
+
+  for host in ${hosts};do
+    _hosts_block "$host"
+  done
+}
+
+hosts_unblock() {
+  local hosts="${@:2}"
+
+  for host in ${hosts};do
+    _hosts_unblock "$host"
+  done
+}
+
+hosts_undirect() {
+  local hosts="${@:2}"
+
+  for host in ${hosts};do
+    _hosts_undirect "$host"
+  done
+}
+
+# hosts_list: list direct or blocked hosts
+hosts_list() {
+  local match_color=""
+  local match_string=""
+  local total=0
+  # Enabled hosts are defined only in the direct file, so we can just list
+  # those entries.
+  if [ "$1" = "direct" ]; then
+    match_color=$green
+    hosts=$(grep -v '^#' "${DIRECT_HOSTS}")
+  # A complete list of blocked hosts should be built from the compiled hosts
+  # file.
+  elif [ "$1" = "blocked" ]; then
+    match_color=$red
+    hosts=$(grep -v '^#' "${BLOCKED_HOSTS}")
+  fi
+  for host in $hosts;do
+    printf "$match_color\u25CF${reset} ${white}${host}${reset}\n"
+    total=$((total + 1))
+  done
+  msg_check "${white}total: ${yellow}${total}${reset}"
+}
+
+# hosts_fetch: update the remote hosts file
+hosts_fetch() {
+  if [ -z $remote_hosts ]; then
+    msg_error "no remote hosts URL defined"
+    exit 1
+  fi
+
+  root_check
+  hosts_init
+  local tmpfile=$(mktemp)
+  local n=0;
+  for i in ${remote_hosts};
+  do
+    curl -L "$i" -s > "${tmpfile}";
+    echo $'\n' >> "${tmpfile}";
+  done;
+
+  # Remove duplicate hosts
+  uniq_remote=$(grep "^[^# ]" "${tmpfile}"| sed -E "s/[\t ]+/\t/" | sort -t $'\t' -k 2 -u)
+  echo "${uniq_remote}" > "${TMP_HOSTS}"
+  # If a previous remote hosts files exists, count the number of different
+  # lines between the old and new files.
+  if [ -f "${REMOTE_HOSTS}" ]; then
+    n=$(diff -U 0 "${REMOTE_HOSTS}" "${TMP_HOSTS}" | grep -v ^@ | tail -n +3 | wc -l)
+  else
+    n=$(wc -l "${tmpfile}" | cut -d ' ' -f1)
+  fi
+  # Clean temporary files created by hostsctl.
+  hosts_clean_tmp
+  msg_check "${purple}$n${reset} modified entries found from remote."
+}
+
+hosts_pull() {
+  root_check
+  if [ ! -f ${TMP_HOSTS} ]; then
+    hosts_fetch
+  fi
+  cat "${TMP_HOSTS}" > "${REMOTE_HOSTS}"
+}
+
+# hosts_update: update the remote hosts and export to $HOSTS
+hosts_update() {
+  root_check
+  hosts_init
+  hosts_fetch
+  hosts_pull
+  hosts_merge
+}
+
+# hosts_restore: remove remote and explicitly blocked hosts from /etc/hosts
+hosts_restore() {
+  root_check
+  cp "${USER_HOSTS}" "${HOSTS}"
+  msg_check "${HOSTS} has been restored."
+  msg_info  "run ${yellow}\'hostsctl merge\'${reset} to undo."
+}
+
+# hosts_clean: remove temporary files created by hostsctl.
+hosts_clean_tmp() {
+  rm -f /tmp/hostsctl.tmp.*
+}
+
+hosts_clean() {
+  rm -f ${TMP_HOSTS}
+}
+
+# hosts_init: initialize required files.
+hosts_init() {
+  if [ ! -d ${HOSTSCTL_DIR} ]; then
+    mkdir ${HOSTSCTL_DIR}
+  fi
+  
+  if [ ! -e ${USER_HOSTS} ]; then
+    cp ${HOSTS} ${USER_HOSTS}
+  fi
+    
+  if [ ! -e ${REMOTE_HOSTS} ]; then
+    touch ${REMOTE_HOSTS}
+  fi
+    
+  if [ ! -e ${DIRECT_HOSTS} ]; then
+    touch ${DIRECT_HOSTS}
+  fi
+  if [ ! -e ${BLOCKED_HOSTS} ]; then
+    touch ${BLOCKED_HOSTS}
+  fi
+}
+
+case $1 in
+  block)
+    hosts_block    "$@";;
+  unblock)
+    hosts_unblock  "$@";;
+  direct)
+    hosts_direct   "$@";;
+  undirect)
+    hosts_undirect "$@";;
+  merge)
+    hosts_merge;;
+  export)
+    hosts_export;;
+  update)
+    hosts_update;;
+  fetch)
+    hosts_fetch;;
+  pull)
+    hosts_pull;;
+  clean)
+    hosts_clean;;
+  list-direct)
+    hosts_list "direct";;
+  list-blocked)
+    hosts_list "blocked";;
+  restore)
+    hosts_restore;;
+  --help)
+    hosts_usage;;
+  *)
+    hosts_usage;;
+esac
+
