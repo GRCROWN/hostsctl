@@ -49,7 +49,7 @@ else
   yellow="\e[1;33m";
 fi;
 
-PREFIX="./etc"
+PREFIX="/etc"
 HOSTS="${PREFIX}/hosts"
 HOSTSCTL_DIR="${PREFIX}/hostsctl.d"
 REMOTE_HOSTS="${HOSTSCTL_DIR}/remote.hosts"
